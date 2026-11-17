@@ -23,13 +23,14 @@ Machine learning and analytical baselines for predicting macromolecular crystal 
    python train_descriptors.py training_data.txt validation_data.txt --descriptors additional_descriptors.txt --map-metadata map_metadata.tsv --test-file test_data.txt --output-model descriptor_model.joblib
    ```
 
-4. **Train 3D Deep Models, Export to ONNX & Run Unified Inference (`train.py`, `export_to_onnx.py`, `predict_solvent_content.py`)**
+4. **Train Multi-Modal 3D Deep Models, Export & Run Unified Inference (`train.py`, `export_to_onnx.py`, `predict_solvent_content.py`)**
+   Trains `ResidualUNetSE3D` (`unet`) or `ViTVNet` (`vitvnet`) with 48-way 3D cube-symmetry augmentations, pre-phasing metadata FiLM fusion (`--map-metadata`), Weighted Huber loss with Inverse Label-Density Weighting, CUDA mixed precision (`torch.amp`), and `AdamW` + cosine warmup (supporting multi-GPU `torchrun` DDP):
    ```bash
-   python train.py training_data.txt validation_data.txt unet
-   python train.py training_data.txt validation_data.txt vitvnet
-   python export_to_onnx.py models/model_39 unet --output unet_model.onnx
-   python predict_solvent_content.py example.mtz unet_model.onnx
+   python train.py training_data.txt validation_data.txt unet --map-metadata map_metadata.tsv
+   python train.py training_data.txt validation_data.txt vitvnet --map-metadata map_metadata.tsv
+   python predict_solvent_content.py example.mtz models/best_unet.pt --gpu
    python predict_solvent_content.py example.map descriptor_model.joblib
+   python export_to_onnx.py models/best_unet.pt unet --output unet_model.onnx
    ```
 
 ## Running Tests
