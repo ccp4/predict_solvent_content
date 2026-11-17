@@ -688,9 +688,9 @@ class SpatialSELayer3D(nn.Module):
         # channel squeeze
         batch_size, channel, D, H, W = x.size()
 
-        if weights:
-            weights = weights.view(1, channel, 1, 1)
-            out = F.conv2d(x, weights)
+        if weights is not None:
+            weights = weights.view(1, channel, 1, 1, 1)
+            out = F.conv3d(x, weights)
         else:
             out = self.conv(x)
 
@@ -811,7 +811,8 @@ class AbstractUNet(nn.Module):
         )
 
         self.global_pool = nn.AdaptiveAvgPool3d(1)
-        self.resnet_se_downsample = ResNetDownsampleBlockSE(f_maps[-1], f_maps[-1])
+        self.resnet_se_downsample1 = ResNetDownsampleBlockSE(f_maps[-1], f_maps[-1])
+        self.resnet_se_downsample2 = ResNetDownsampleBlockSE(f_maps[-1], f_maps[-1])
 
         self.fc = nn.Linear(f_maps[-1], 1)
         self.sigmoid = nn.Sigmoid()
@@ -831,9 +832,9 @@ class AbstractUNet(nn.Module):
         """
         for encoder in self.encoders:
             x = encoder(x)
-        x = self.resnet_se_downsample(x) # 256, 8, 8, 8
-        x = self.resnet_se_downsample(x) # 256, 4, 4, 4
-        x = self.global_pool(x) # 256 1, 1, 1
+        x = self.resnet_se_downsample1(x)
+        x = self.resnet_se_downsample2(x)
+        x = self.global_pool(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         x = self.sigmoid(x)

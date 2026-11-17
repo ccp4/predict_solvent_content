@@ -1,18 +1,42 @@
+import copy
+import math
 import torch
 import torch.nn as nn
-from torch.nn import Dropout, Softmax, Linear, Conv3d, LayerNorm
+from torch.nn import Conv3d, Dropout, LayerNorm, Linear, Softmax
 from torch.nn.modules.utils import _triple
-import copy
-import ml_collections
-import math
+
+try:
+    import ml_collections
+except ImportError:
+    ml_collections = None
 
 """
-ViT-V-Net implementation modified to only use the encoder component and 
+ViT-V-Net implementation modified to only use the encoder component and
 output a scalar value.
 
-Code adapted from 
+Code adapted from
 https://github.com/junyuchen245/ViT-V-Net_for_3D_Image_Registration_Pytorch
 """
+
+
+class _AttrDict(dict):
+    """Lightweight ConfigDict fallback when ml_collections is not installed."""
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
+def _make_config_dict(initial=None):
+    if ml_collections is not None:
+        return ml_collections.ConfigDict(initial or {})
+    return _AttrDict(initial or {})
+
 
 class Attention(nn.Module):
     def __init__(self, config, vis):
@@ -60,19 +84,19 @@ class Attention(nn.Module):
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
+
 class ViTVNet(nn.Module):
-    def __init__(self, config, img_size=(256, 256, 256), vis=False):
+    def __init__(self, config, img_size=(128, 128, 128), vis=False):
         super(ViTVNet, self).__init__()
         self.transformer = Transformer(config, img_size, vis)
         self.config = config
         self.to_latent = nn.Identity()
-        self.linear_head = nn.Linear(252, 1)
+        self.linear_head = nn.Linear(config.hidden_size, 1)
         self.sigmoid = nn.Sigmoid()
-        self.to_latent = nn.Identity()
-        
+
     def forward(self, x):
-        x, _, _ = self.transformer(x)
-        x = x.mean(dim = 1)
+        x, _ = self.transformer(x)
+        x = x.mean(dim=1)
         x = self.to_latent(x)
         return self.sigmoid(self.linear_head(x))
 
@@ -96,6 +120,7 @@ class Encoder(nn.Module):
         encoded = self.encoder_norm(hidden_states)
         return encoded, attn_weights
 
+
 class Transformer(nn.Module):
     def __init__(self, config, img_size, vis):
         super(Transformer, self).__init__()
@@ -103,9 +128,10 @@ class Transformer(nn.Module):
         self.encoder = Encoder(config, vis)
 
     def forward(self, input_ids):
-        embedding_output, features = self.embeddings(input_ids)
-        encoded, attn_weights = self.encoder(embedding_output)  # (B, n_patch, hidden)
-        return encoded, attn_weights, features
+        embedding_output = self.embeddings(input_ids)
+        encoded, attn_weights = self.encoder(embedding_output)
+        return encoded, attn_weights
+
 
 class Embeddings(nn.Module):
     def __init__(self, config, img_size):
@@ -113,80 +139,90 @@ class Embeddings(nn.Module):
         self.config = config
         down_factor = config.down_factor
         patch_size = _triple(config.patches["size"])
-        n_patches = int((img_size[0]/2**down_factor// patch_size[0]) * (img_size[1]/2**down_factor// patch_size[1]) * (img_size[2]/2**down_factor// patch_size[2]))
+        n_patches = int(
+            (img_size[0] // (2**down_factor) // patch_size[0])
+            * (img_size[1] // (2**down_factor) // patch_size[1])
+            * (img_size[2] // (2**down_factor) // patch_size[2])
+        )
         self.hybrid_model = CNNEncoder(config, n_channels=1)
-        in_channels = config['encoder_channels'][-1]
-        self.patch_embeddings = Conv3d(in_channels=in_channels,
-                                       out_channels=config.hidden_size,
-                                       kernel_size=patch_size,
-                                       stride=patch_size)
-        self.position_embeddings = nn.Parameter(torch.zeros(1, n_patches, config.hidden_size))
-
+        in_channels = config["encoder_channels"][-1]
+        self.patch_embeddings = Conv3d(
+            in_channels=in_channels,
+            out_channels=config.hidden_size,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.position_embeddings = nn.Parameter(
+            torch.zeros(1, n_patches, config.hidden_size)
+        )
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
     def forward(self, x):
-        x, features = self.hybrid_model(x)
-        x = self.patch_embeddings(x) 
+        x = self.hybrid_model(x)
+        x = self.patch_embeddings(x)
         x = x.flatten(2)
         x = x.transpose(-1, -2)
         embeddings = x + self.position_embeddings
         embeddings = self.dropout(embeddings)
-        return embeddings, features
+        return embeddings
+
 
 class CNNEncoder(nn.Module):
     def __init__(self, config, n_channels=1):
         super(CNNEncoder, self).__init__()
         self.n_channels = n_channels
         encoder_channels = config.encoder_channels
-        self.down_num = config.down_num
         self.inc = DoubleConv(n_channels, encoder_channels[0])
         self.down1 = Down(encoder_channels[0], encoder_channels[1])
         self.down2 = Down(encoder_channels[1], encoder_channels[2])
         self.width = encoder_channels[-1]
+
     def forward(self, x):
-        features = []
-        x1 = self.inc(x)
-        features.append(x1)
-        x2 = self.down1(x1)
-        features.append(x2)
-        feats = self.down2(x2)
-        features.append(feats)
-        feats_down = feats
-        for i in range(self.down_num):
-            feats_down = nn.MaxPool3d(2)(feats_down)
-            features.append(feats_down)
-        return feats, features[::-1]
+        x = self.inc(x)
+        x = self.down1(x)
+        x = self.down2(x)
+        return x
 
 
 class Down(nn.Module):
-    """Downscaling with maxpool then double conv"""
+    """Downscaling with maxpool then double conv."""
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool3d(2),
-            DoubleConv(in_channels, out_channels)
+            DoubleConv(in_channels, out_channels),
         )
 
     def forward(self, x):
         return self.maxpool_conv(x)
 
-class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
 
-    def __init__(self, in_channels, out_channels, mid_channels=None):
+class DoubleConv(nn.Module):
+    """(Conv3d => GroupNorm => ReLU) * 2."""
+
+    def __init__(self, in_channels, out_channels, mid_channels=None, num_groups=8):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
+        g1 = min(num_groups, mid_channels)
+        while mid_channels % g1 != 0:
+            g1 -= 1
+        g2 = min(num_groups, out_channels)
+        while out_channels % g2 != 0:
+            g2 -= 1
         self.double_conv = nn.Sequential(
-            nn.Conv3d(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.Conv3d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(g1, mid_channels),
             nn.ReLU(inplace=True),
-            nn.Conv3d(mid_channels, out_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
+            nn.Conv3d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(g2, out_channels),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
         return self.double_conv(x)
+
 
 class Block(nn.Module):
     def __init__(self, config, vis):
@@ -199,7 +235,6 @@ class Block(nn.Module):
 
     def forward(self, x):
         h = x
-
         x = self.attention_norm(x)
         x, weights = self.attn(x)
         x = x + h
@@ -210,6 +245,7 @@ class Block(nn.Module):
         x = x + h
         return x, weights
 
+
 class Mlp(nn.Module):
     def __init__(self, config):
         super(Mlp, self).__init__()
@@ -217,7 +253,6 @@ class Mlp(nn.Module):
         self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
         self.act_fn = torch.nn.functional.gelu
         self.dropout = Dropout(config.transformer["dropout_rate"])
-
         self._init_weights()
 
     def _init_weights(self):
@@ -234,26 +269,22 @@ class Mlp(nn.Module):
         x = self.dropout(x)
         return x
 
-def get_3DReg_config():
-    config = ml_collections.ConfigDict()
-    config.patches = ml_collections.ConfigDict({'size': (8, 8, 8)})
-    config.patches.grid = (8, 8, 8)
-    config.hidden_size = 252
-    config.transformer = ml_collections.ConfigDict()
-    config.transformer.mlp_dim = 3072
-    config.transformer.num_heads = 12
-    config.transformer.num_layers = 12
-    config.transformer.attention_dropout_rate = 0.0
-    config.transformer.dropout_rate = 0.1
-    config.patch_size = 8
 
-    config.conv_first_channel = 512
+def get_3DReg_config(grid_size: int = 128):
+    # Scale patch size so token grid remains 8x8x8 = 512 patches (16 A^3 physical patch)
+    patch = max(1, grid_size // 32)
+    config = _make_config_dict()
+    config.patches = _make_config_dict({"size": (patch, patch, patch), "grid": (8, 8, 8)})
+    config.hidden_size = 252
+    config.transformer = _make_config_dict({
+        "mlp_dim": 1008,
+        "num_heads": 12,
+        "num_layers": 12,
+        "attention_dropout_rate": 0.0,
+        "dropout_rate": 0.1,
+    })
+    config.patch_size = patch
     config.encoder_channels = (16, 32, 32)
     config.down_factor = 2
-    config.down_num = 2
-    config.decoder_channels = (96, 48, 32, 32, 16)
-    config.skip_channels = (32, 32, 32, 32, 16)
     config.n_dims = 3
-    config.n_skip = 5
     return config
-
