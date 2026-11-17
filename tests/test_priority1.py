@@ -112,13 +112,13 @@ class TestPriority1(unittest.TestCase):
             lines = [ln.strip() for ln in out_txt.read_text(encoding="utf-8").splitlines() if ln.strip()]
             # Header + 2 processed files (second file must NOT crash with kurtosis shadowing!)
             self.assertEqual(len(lines), 3)
+            header = lines[0].split()
             for row in lines[1:]:
                 cols = row.split()
-                self.assertEqual(len(cols), 16)
-                std_val = float(cols[5])
-                skel_len = int(cols[12])
-                self.assertGreater(std_val, 0.2)
-                self.assertGreater(skel_len, 0)
+                self.assertEqual(len(cols), len(header))
+                row_dict = {k: float(v) for k, v in zip(header[1:], cols[1:])}
+                self.assertGreater(row_dict["std"], 0.2)
+                self.assertGreater(row_dict["skeleton_length"], 0.0)
 
     def test_getsolv_quality_filters_and_hexagonal_volume(self):
         with tempfile.TemporaryDirectory() as tmp:

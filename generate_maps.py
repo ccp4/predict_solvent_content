@@ -133,8 +133,9 @@ def main() -> None:
         if write_header:
             meta_f.write(
                 "name\tnpy_path\torigin_to_sigma\tasu_volume\tcell_volume\t"
-                "spacegroup_number\tpoint_group_order\tnative_d_min\tused_d_min\t"
-                "low_res_intensity_ratio\tacentric_e2_minus_1\n"
+                "asu_equiv_radius\tcell_min_len\tcell_mid_len\tcell_max_len\tcell_anisotropy\t"
+                "spacegroup_number\tpoint_group_order\tn_symops\tnative_d_min\tused_d_min\td_max\t"
+                "wilson_b_est\tlow_res_intensity_ratio\tacentric_e2_minus_1\tmean_e4\n"
             )
 
         for file_str in raw_paths:
@@ -153,9 +154,12 @@ def main() -> None:
                 meta_f.write(
                     f"{name}\t{out_path}\t{res.origin_to_sigma:.6f}\t"
                     f"{res.asu_volume:.3f}\t{res.cell_volume:.3f}\t"
-                    f"{res.spacegroup_number}\t{res.point_group_order}\t"
-                    f"{res.native_d_min:.3f}\t{res.used_d_min:.3f}\t"
-                    f"{res.low_res_intensity_ratio:.6f}\t{res.acentric_e2_minus_1:.6f}\n"
+                    f"{res.asu_equiv_radius:.3f}\t{res.cell_min_len:.3f}\t"
+                    f"{res.cell_mid_len:.3f}\t{res.cell_max_len:.3f}\t{res.cell_anisotropy:.4f}\t"
+                    f"{res.spacegroup_number}\t{res.point_group_order}\t{res.n_symops}\t"
+                    f"{res.native_d_min:.3f}\t{res.used_d_min:.3f}\t{res.d_max:.3f}\t"
+                    f"{res.wilson_b_est:.3f}\t{res.low_res_intensity_ratio:.6f}\t"
+                    f"{res.acentric_e2_minus_1:.6f}\t{res.mean_e4:.6f}\n"
                 )
                 meta_f.flush()
             except Exception as exc:

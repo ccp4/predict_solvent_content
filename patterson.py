@@ -54,11 +54,21 @@ class PattersonResult:
     spacegroup_number: int
     spacegroup_hm: str
     point_group_order: int
+    n_symops: int = 1
+    cell_min_len: float = float("nan")
+    cell_mid_len: float = float("nan")
+    cell_max_len: float = float("nan")
+    cell_anisotropy: float = float("nan")
+    asu_equiv_radius: float = float("nan")
     native_d_min: float = float("nan")
     used_d_min: float = float("nan")
     d_max: float = float("nan")
+    wilson_b_est: float = float("nan")
     low_res_intensity_ratio: float = float("nan")
     acentric_e2_minus_1: float = float("nan")
+    mean_e4: float = float("nan")
+    unit_cell_non_origin: Optional[np.ndarray] = None
+    asu_non_origin: Optional[np.ndarray] = None
 
 
 def get_patterson_spacegroup(sg: Optional[gemmi.SpaceGroup]) -> gemmi.SpaceGroup:
@@ -216,22 +226,31 @@ def _extract_crystal_metadata(
     cell: gemmi.UnitCell,
     sg: Optional[gemmi.SpaceGroup],
 ) -> Dict[str, Union[float, int, str]]:
-    """Extract unit cell, ASU volume, and symmetry metadata."""
+    """Extract unit cell, ASU volume, sorted axis lengths, and symmetry metadata."""
     if sg is None:
         sg = gemmi.find_spacegroup_by_name("P 1")
     ops = sg.operations()
-    n_sym = len(ops)
+    n_sym = max(1, len(ops))
     n_cen = len(ops.cen_ops)
     point_group_order = max(1, len(ops.sym_ops))
     cell_vol = float(cell.volume)
-    asu_vol = cell_vol / float(max(1, n_sym))
+    asu_vol = cell_vol / float(n_sym)
+    lengths = sorted([float(cell.a), float(cell.b), float(cell.c)])
+    anisotropy = lengths[2] / lengths[0] if lengths[0] > 1e-6 else float("nan")
+    asu_radius = ((3.0 * asu_vol) / (4.0 * math.pi)) ** (1.0 / 3.0) if asu_vol > 0 else float("nan")
     return {
         "cell_volume": cell_vol,
         "asu_volume": asu_vol,
         "spacegroup_number": int(sg.number),
         "spacegroup_hm": str(sg.hm),
         "point_group_order": int(point_group_order),
+        "n_symops": int(n_sym),
         "n_centering": int(n_cen),
+        "cell_min_len": lengths[0],
+        "cell_mid_len": lengths[1],
+        "cell_max_len": lengths[2],
+        "cell_anisotropy": anisotropy,
+        "asu_equiv_radius": asu_radius,
     }
 
 
@@ -294,6 +313,29 @@ def compute_normalized_patterson_grid_from_mtz(
     else:
         low_res_ratio = float("nan")
 
+    # Estimate overall Wilson B-factor from native shells in the d <= 4.5 A Wilson regime
+    wilson_mask = valid & (d_arr <= 4.5)
+    if np.sum(wilson_mask) < 60:
+        wilson_mask = valid
+    wilson_b_est = float("nan")
+    n_wilson = int(np.sum(wilson_mask))
+    if n_wilson >= 40:
+        w_bins = max(4, min(25, n_wilson // 80))
+        wb = gemmi.Binner()
+        wb.setup_from_1_d2(w_bins, gemmi.Binner.Method.EqualCount, inv_d2[wilson_mask], cell)
+        w_idx = wb.get_bins_from_1_d2(inv_d2[wilson_mask])
+        w_cnt = np.bincount(w_idx, minlength=w_bins)
+        w_sum_i = np.bincount(w_idx, weights=i_over_eps[wilson_mask], minlength=w_bins)
+        w_sum_x = np.bincount(w_idx, weights=inv_d2[wilson_mask], minlength=w_bins)
+        ok_b = (w_cnt >= 5) & (w_sum_i > 0)
+        if np.sum(ok_b) >= 3:
+            wx = w_sum_x[ok_b] / w_cnt[ok_b]
+            wy = np.log(w_sum_i[ok_b] / w_cnt[ok_b])
+            if float(np.ptp(wx)) > 1e-4:
+                # <I/eps> ~ exp(-B / (2 * d^2))  =>  slope = -B / 2  =>  B = -2 * slope
+                slope_w = float(np.polyfit(wx, wy, 1)[0])
+                wilson_b_est = max(0.0, -2.0 * slope_w)
+
     # Apply uniform high-resolution cutoff to prevent d_min peak-sharpness confounding
     if d_min is not None and d_min > 0:
         trunc_valid = valid & (d_arr >= d_min)
@@ -332,6 +374,7 @@ def compute_normalized_patterson_grid_from_mtz(
         np.clip(e2, 0.0, float(max_e ** 2), out=e2)
 
     acentric_e2_minus_1 = float(np.mean(np.abs(e2[valid] - 1.0)))
+    mean_e4 = float(np.mean(e2[valid].astype(np.float64) ** 2))
 
     # Build minimal in-memory Patterson MTZ and run FFT with symmorphic + inversion symmetry
     patt_mtz = gemmi.Mtz(with_base=True)
@@ -358,8 +401,10 @@ def compute_normalized_patterson_grid_from_mtz(
         "native_d_min": native_d_min,
         "used_d_min": used_d_min,
         "d_max": d_max,
+        "wilson_b_est": wilson_b_est,
         "low_res_intensity_ratio": low_res_ratio,
         "acentric_e2_minus_1": acentric_e2_minus_1,
+        "mean_e4": mean_e4,
     })
     return grid, meta
 
@@ -386,6 +431,7 @@ def interpolate_and_normalize_patterson(
     grid_spacing: float = DEFAULT_GRID_SPACING,
     origin_mask_radius: float = DEFAULT_ORIGIN_MASK_RADIUS,
     metadata: Optional[Dict[str, Union[float, int, str]]] = None,
+    return_unit_cell_values: bool = False,
 ) -> PattersonResult:
     """
     Mask periodic + Bravais-centering origin peaks on a copy of the unit-cell grid,
@@ -440,6 +486,13 @@ def interpolate_and_normalize_patterson(
     if origin_mask_radius > 0.0:
         grid_arr[is_origin] = 0.0
 
+    uc_vals: Optional[np.ndarray] = None
+    asu_vals: Optional[np.ndarray] = None
+    if return_unit_cell_values:
+        uc_vals = grid_arr[non_origin].astype(np.float32, copy=True) if np.any(non_origin) else grid_arr.ravel().astype(np.float32, copy=True)
+        asu_mask = (np.array(work_grid.masked_asu().mask_array, copy=False) == 0) & non_origin
+        asu_vals = grid_arr[asu_mask].astype(np.float32, copy=True) if np.any(asu_mask) else uc_vals
+
     # Interpolate onto centered Cartesian grid: r = diag(spacing) * idx - 0.5 * grid_size * spacing
     arr = np.zeros(grid_size, dtype=np.float32)
     tr = gemmi.Transform()
@@ -466,11 +519,74 @@ def interpolate_and_normalize_patterson(
         spacegroup_number=int(meta.get("spacegroup_number", 1)),
         spacegroup_hm=str(meta.get("spacegroup_hm", "P 1")),
         point_group_order=int(meta.get("point_group_order", 1)),
+        n_symops=int(meta.get("n_symops", 1)),
+        cell_min_len=float(meta.get("cell_min_len", float("nan"))),
+        cell_mid_len=float(meta.get("cell_mid_len", float("nan"))),
+        cell_max_len=float(meta.get("cell_max_len", float("nan"))),
+        cell_anisotropy=float(meta.get("cell_anisotropy", float("nan"))),
+        asu_equiv_radius=float(meta.get("asu_equiv_radius", float("nan"))),
         native_d_min=float(meta.get("native_d_min", float("nan"))),
         used_d_min=float(meta.get("used_d_min", float("nan"))),
         d_max=float(meta.get("d_max", float("nan"))),
+        wilson_b_est=float(meta.get("wilson_b_est", float("nan"))),
         low_res_intensity_ratio=float(meta.get("low_res_intensity_ratio", float("nan"))),
         acentric_e2_minus_1=float(meta.get("acentric_e2_minus_1", float("nan"))),
+        mean_e4=float(meta.get("mean_e4", float("nan"))),
+        unit_cell_non_origin=uc_vals,
+        asu_non_origin=asu_vals,
+    )
+
+
+def _load_cartesian_npy_patterson(
+    npy_path: Path,
+    grid_spacing: float = DEFAULT_GRID_SPACING,
+    origin_mask_radius: float = DEFAULT_ORIGIN_MASK_RADIUS,
+    return_unit_cell_values: bool = False,
+) -> PattersonResult:
+    """Load a pre-computed 3D Cartesian .npy Patterson map without any crystal metadata."""
+    arr = np.load(str(npy_path)).astype(np.float32, copy=True)
+    if arr.ndim == 4 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D Patterson array in {npy_path}, got shape {arr.shape}")
+
+    nx, ny, nz = arr.shape
+    cx = (np.arange(nx, dtype=np.float32) - 0.5 * nx) * grid_spacing
+    cy = (np.arange(ny, dtype=np.float32) - 0.5 * ny) * grid_spacing
+    cz = (np.arange(nz, dtype=np.float32) - 0.5 * nz) * grid_spacing
+    r2 = cx[:, None, None] ** 2 + cy[None, :, None] ** 2 + cz[None, None, :] ** 2
+    non_origin = r2 >= (origin_mask_radius ** 2)
+
+    raw_origin = float(arr[nx // 2, ny // 2, nz // 2])
+    mu = float(np.mean(arr[non_origin], dtype=np.float64))
+    sigma = float(np.std(arr[non_origin], dtype=np.float64))
+    if sigma < 1e-12:
+        sigma = 1.0
+
+    # If origin was unmasked in the .npy, record origin_to_sigma and normalize; otherwise preserve NaN
+    if abs(raw_origin - mu) > 3.0 * sigma:
+        origin_to_sigma = (raw_origin - mu) / sigma
+    else:
+        origin_to_sigma = float("nan")
+
+    if abs(mu) > 0.05 or abs(sigma - 1.0) > 0.15:
+        arr = (arr - mu) / sigma
+    arr[~non_origin] = 0.0
+
+    uc_vals = arr[non_origin].astype(np.float32, copy=True) if return_unit_cell_values else None
+    return PattersonResult(
+        array=arr,
+        origin_to_sigma=origin_to_sigma,
+        non_origin_mean=mu,
+        non_origin_std=sigma,
+        cell_volume=float("nan"),
+        asu_volume=float("nan"),
+        spacegroup_number=0,
+        spacegroup_hm="Unknown",
+        point_group_order=0,
+        n_symops=0,
+        unit_cell_non_origin=uc_vals,
+        asu_non_origin=uc_vals,
     )
 
 
@@ -480,14 +596,22 @@ def compute_patterson_from_file(
     grid_spacing: float = DEFAULT_GRID_SPACING,
     d_min: Optional[float] = DEFAULT_D_MIN,
     origin_mask_radius: float = DEFAULT_ORIGIN_MASK_RADIUS,
+    return_unit_cell_values: bool = False,
 ) -> PattersonResult:
     """
     Unified entry point supporting .mtz, .cif/.ent structure-factor files,
-    and .map/.map.gz/.ccp4 Patterson map files.
+    .map/.map.gz/.ccp4 Patterson map files, and pre-computed .npy arrays.
     """
     path = Path(file_path)
     name_lower = path.name.lower()
 
+    if name_lower.endswith(".npy"):
+        return _load_cartesian_npy_patterson(
+            path,
+            grid_spacing=grid_spacing,
+            origin_mask_radius=origin_mask_radius,
+            return_unit_cell_values=return_unit_cell_values,
+        )
     if name_lower.endswith((".map", ".map.gz", ".ccp4", ".ccp4.gz", ".mrc", ".mrc.gz")):
         grid, meta = load_patterson_ccp4_map(path)
     elif name_lower.endswith(".mtz"):
@@ -509,4 +633,5 @@ def compute_patterson_from_file(
         grid_spacing=grid_spacing,
         origin_mask_radius=origin_mask_radius,
         metadata=meta,
+        return_unit_cell_values=return_unit_cell_values,
     )
